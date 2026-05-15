@@ -25,6 +25,31 @@ println!("reply from {} in {:?}", result.reply.source, result.rtt);
 # }
 ```
 
+For multicast or other cases where more than one host may reply to a single
+request, use `ping_replies`:
+
+```rust
+use std::{net::{Ipv6Addr, SocketAddr, SocketAddrV6}, time::Duration};
+
+use tiny_ping::{Pinger, SocketType};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let target = SocketAddr::V6(SocketAddrV6::new(
+    "ff02::1".parse::<Ipv6Addr>()?,
+    0,
+    0,
+    2,
+));
+let mut pinger = Pinger::with_socket_addr(target, SocketType::Raw)?;
+pinger.timeout(Duration::from_secs(1));
+
+for result in pinger.ping_replies(1).await? {
+    println!("reply from {} in {:?}", result.reply.source, result.rtt);
+}
+# Ok(())
+# }
+```
+
 Raw sockets usually need root or capabilities.
 
 DGRAM sockets can work without that on some systems:

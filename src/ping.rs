@@ -30,7 +30,7 @@ pub struct PingResult {
 /// A Ping struct represents the state of one particular ping instance.
 #[derive(Debug, Clone)]
 pub struct Pinger {
-    host: IpAddr,
+    target: SocketAddr,
     ident: u16,
     size: usize,
     timeout: Duration,
@@ -46,21 +46,29 @@ impl Pinger {
 
     /// Creates a new ping instance using a specific socket type.
     pub fn with_socket_type(host: IpAddr, socket_type: SocketType) -> Result<Pinger> {
+        Self::with_socket_addr(SocketAddr::new(host, 0), socket_type)
+    }
+
+    /// Creates a new ping instance using a specific socket address and socket type.
+    ///
+    /// The port is ignored. For IPv6, callers can use this to provide a
+    /// `SocketAddrV6` scope ID, for example when targeting link-local multicast.
+    pub fn with_socket_addr(target: SocketAddr, socket_type: SocketType) -> Result<Pinger> {
         Ok(Pinger {
-            host,
+            target,
             ident: default_ident(),
             size: DEFAULT_PAYLOAD_SIZE,
             timeout: DEFAULT_TIMEOUT,
             ttl: None,
-            socket: AsyncSocket::new(host, socket_type)?,
+            socket: AsyncSocket::new(target.ip(), socket_type)?,
         })
     }
 
     /// Changes the socket type and recreates the underlying socket.
     pub fn socket_type(&mut self, socket_type: SocketType) -> Result<&mut Pinger> {
-        let socket = AsyncSocket::new(self.host, socket_type)?;
+        let socket = AsyncSocket::new(self.target.ip(), socket_type)?;
         if let Some(ttl) = self.ttl {
-            socket.set_ttl(self.host, ttl)?;
+            socket.set_ttl(self.target.ip(), ttl)?;
         }
         self.socket = socket;
         Ok(self)
@@ -106,7 +114,7 @@ impl Pinger {
 
     /// Set the outgoing IPv4 TTL or IPv6 unicast hop limit.
     pub fn ttl(&mut self, ttl: u32) -> Result<&mut Pinger> {
-        self.socket.set_ttl(self.host, ttl)?;
+        self.socket.set_ttl(self.target.ip(), ttl)?;
         self.ttl = Some(ttl);
         Ok(self)
     }
@@ -116,10 +124,10 @@ impl Pinger {
         loop {
             let (size, source) = self.socket.recv_from(&mut buffer).await?;
             let buf = unsafe { assume_init(&buffer[..size]) };
-            let source = source.map(|addr| addr.ip()).unwrap_or(self.host);
+            let source = source.map(|addr| addr.ip()).unwrap_or(self.target.ip());
             let decoded = match self.socket.socket_type() {
-                SocketType::Raw if self.host.is_ipv6() => EchoReply::decode_raw(source, buf),
-                SocketType::Raw => EchoReply::decode_raw(self.host, buf),
+                SocketType::Raw if self.target.ip().is_ipv6() => EchoReply::decode_raw(source, buf),
+                SocketType::Raw => EchoReply::decode_raw(self.target.ip(), buf),
                 SocketType::Dgram => EchoReply::decode_dgram(source, buf),
             };
 
@@ -148,18 +156,23 @@ impl Pinger {
         payload.is_empty() || reply.payload == payload
     }
 
-    /// Send a ping request with sequence number.
-    pub async fn ping(&self, seq_cnt: u16) -> Result<PingResult> {
-        let payload = request_payload(self.ident, seq_cnt, self.size);
+    async fn send_request(&self, seq_cnt: u16, payload: &[u8]) -> Result<Instant> {
         let packet =
-            EchoRequest::new(self.host, self.ident, seq_cnt).encode_with_payload(&payload)?;
-        let sock_addr = SocketAddr::new(self.host, 0);
+            EchoRequest::new(self.target.ip(), self.ident, seq_cnt).encode_with_payload(payload)?;
 
         let sent = Instant::now();
-        let size = self.socket.send_to(&packet, &sock_addr.into()).await?;
+        let size = self.socket.send_to(&packet, &self.target.into()).await?;
         if size != packet.len() {
             return Err(Error::InvalidSize);
         }
+
+        Ok(sent)
+    }
+
+    /// Send a ping request with sequence number.
+    pub async fn ping(&self, seq_cnt: u16) -> Result<PingResult> {
+        let payload = request_payload(self.ident, seq_cnt, self.size);
+        let sent = self.send_request(seq_cnt, &payload).await?;
 
         let reply = timeout(self.timeout, self.recv_reply(seq_cnt, &payload))
             .await
@@ -170,6 +183,34 @@ impl Pinger {
             rtt: sent.elapsed(),
             socket_type: self.socket.socket_type(),
         })
+    }
+
+    /// Send one ping request and collect all matching replies until timeout.
+    ///
+    /// This is useful for multicast targets where more than one host can reply
+    /// to the same echo request. Unlike [`Pinger::ping`], a timeout after the
+    /// request is sent is not an error; it ends collection and returns the
+    /// replies seen so far.
+    pub async fn ping_replies(&self, seq_cnt: u16) -> Result<Vec<PingResult>> {
+        let payload = request_payload(self.ident, seq_cnt, self.size);
+        let sent = self.send_request(seq_cnt, &payload).await?;
+        let deadline = sent + self.timeout;
+        let mut replies = Vec::new();
+
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            let reply = match timeout(remaining, self.recv_reply(seq_cnt, &payload)).await {
+                Ok(reply) => reply?,
+                Err(_) => break,
+            };
+
+            replies.push(PingResult {
+                reply,
+                rtt: sent.elapsed(),
+                socket_type: self.socket.socket_type(),
+            });
+        }
+
+        Ok(replies)
     }
 }
 
