@@ -1,40 +1,30 @@
 use std::{
-    collections::HashMap,
     mem::MaybeUninit,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::atomic::{AtomicU16, Ordering},
     time::{Duration, Instant},
 };
 
-use parking_lot::Mutex;
-use tokio::task;
 use tokio::time::timeout;
 
 use crate::error::{Error, Result};
 use crate::icmp::{EchoReply, EchoRequest};
-use crate::unix::AsyncSocket;
+use crate::socket::AsyncSocket;
 
-type Token = (u16, u16);
+pub use crate::socket::SocketType;
 
-#[derive(Debug, Clone)]
-struct Cache {
-    inner: Arc<Mutex<HashMap<Token, Instant>>>,
-}
+const DEFAULT_PAYLOAD_SIZE: usize = 56;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+const TOKEN_SIZE: usize = 8;
 
-impl Cache {
-    fn new() -> Cache {
-        Cache {
-            inner: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
+static NEXT_IDENT: AtomicU16 = AtomicU16::new(1);
 
-    fn insert(&self, ident: u16, seq_cnt: u16, time: Instant) {
-        self.inner.lock().insert((ident, seq_cnt), time);
-    }
-
-    fn remove(&self, ident: u16, seq_cnt: u16) -> Option<Instant> {
-        self.inner.lock().remove(&(ident, seq_cnt))
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct PingResult {
+    pub reply: EchoReply,
+    pub rtt: Duration,
+    pub socket_type: SocketType,
 }
 
 /// A Ping struct represents the state of one particular ping instance.
@@ -44,21 +34,41 @@ pub struct Pinger {
     ident: u16,
     size: usize,
     timeout: Duration,
+    ttl: Option<u32>,
     socket: AsyncSocket,
-    cache: Cache,
 }
 
 impl Pinger {
-    /// Creates a new Ping instance from `IpAddr`.
+    /// Creates a new raw-socket ping instance from `IpAddr`.
     pub fn new(host: IpAddr) -> Result<Pinger> {
+        Self::with_socket_type(host, SocketType::Raw)
+    }
+
+    /// Creates a new ping instance using a specific socket type.
+    pub fn with_socket_type(host: IpAddr, socket_type: SocketType) -> Result<Pinger> {
         Ok(Pinger {
             host,
-            ident: 1,
-            size: 56,
-            timeout: Duration::from_secs(2),
-            socket: AsyncSocket::new(host)?,
-            cache: Cache::new(),
+            ident: default_ident(),
+            size: DEFAULT_PAYLOAD_SIZE,
+            timeout: DEFAULT_TIMEOUT,
+            ttl: None,
+            socket: AsyncSocket::new(host, socket_type)?,
         })
+    }
+
+    /// Changes the socket type and recreates the underlying socket.
+    pub fn socket_type(&mut self, socket_type: SocketType) -> Result<&mut Pinger> {
+        let socket = AsyncSocket::new(self.host, socket_type)?;
+        if let Some(ttl) = self.ttl {
+            socket.set_ttl(self.host, ttl)?;
+        }
+        self.socket = socket;
+        Ok(self)
+    }
+
+    /// Returns the active socket type.
+    pub fn active_socket_type(&self) -> SocketType {
+        self.socket.socket_type()
     }
 
     /// Sets the value for the `SO_BINDTODEVICE` option on this socket.
@@ -82,72 +92,127 @@ impl Pinger {
         self
     }
 
-    /// Set the packet size.(default: 56)
+    /// Set the packet payload size in bytes. (default: 56)
     pub fn size(&mut self, size: usize) -> &mut Pinger {
         self.size = size;
         self
     }
 
-    /// The timeout of each Ping, in seconds. (default: 2s)
+    /// Set the timeout of each ping. (default: 2s)
     pub fn timeout(&mut self, timeout: Duration) -> &mut Pinger {
         self.timeout = timeout;
         self
     }
 
-    async fn recv_reply(&self, seq_cnt: u16) -> Result<(EchoReply, Duration)> {
+    /// Set the outgoing IPv4 TTL or IPv6 unicast hop limit.
+    pub fn ttl(&mut self, ttl: u32) -> Result<&mut Pinger> {
+        self.socket.set_ttl(self.host, ttl)?;
+        self.ttl = Some(ttl);
+        Ok(self)
+    }
+
+    async fn recv_reply(&self, seq_cnt: u16, payload: &[u8]) -> Result<EchoReply> {
         let mut buffer = [MaybeUninit::new(0); 2048];
         loop {
-            let size = self.socket.recv(&mut buffer).await?;
+            let (size, source) = self.socket.recv_from(&mut buffer).await?;
             let buf = unsafe { assume_init(&buffer[..size]) };
-            match EchoReply::decode(self.host, buf) {
-                Ok(reply) => {
-                    // check reply ident is same
-                    if reply.identifier == self.ident && reply.sequence == seq_cnt {
-                        if let Some(ins) = self.cache.remove(self.ident, seq_cnt) {
-                            return Ok((reply, Instant::now() - ins));
-                        }
-                    }
-                    continue;
-                }
-                Err(Error::NotEchoReply) => continue,
-                Err(Error::NotV6EchoReply) => continue,
-                Err(Error::OtherICMP) => continue,
-                Err(e) => {
-                    return Err(e);
-                }
+            let source = source.map(|addr| addr.ip()).unwrap_or(self.host);
+            let decoded = match self.socket.socket_type() {
+                SocketType::Raw if self.host.is_ipv6() => EchoReply::decode_raw(source, buf),
+                SocketType::Raw => EchoReply::decode_raw(self.host, buf),
+                SocketType::Dgram => EchoReply::decode_dgram(source, buf),
+            };
+
+            match decoded {
+                Ok(reply) if self.reply_matches(&reply, seq_cnt, payload) => return Ok(reply),
+                Ok(_) => continue,
+                Err(Error::InvalidPacket)
+                | Err(Error::NotEchoReply)
+                | Err(Error::NotV6EchoReply)
+                | Err(Error::OtherICMP)
+                | Err(Error::UnknownProtocol) => continue,
+                Err(e) => return Err(e),
             }
         }
     }
 
-    /// Send Ping request with sequence number.
-    pub async fn ping(&self, seq_cnt: u16) -> Result<(EchoReply, Duration)> {
-        let sender = self.socket.clone();
-        let mut packet = EchoRequest::new(self.host, self.ident, seq_cnt, self.size).encode()?;
-        let sock_addr = SocketAddr::new(self.host, 0);
-        let ident = self.ident;
-        let cache = self.cache.clone();
-        task::spawn(async move {
-            let _size = sender
-                .send_to(&mut packet, &sock_addr.into())
-                .await
-                .expect("socket send packet error");
-            cache.insert(ident, seq_cnt, Instant::now());
-        });
-
-        match timeout(self.timeout, self.recv_reply(seq_cnt))
-            .await
-            .map_err(|err| {
-                self.cache.remove(ident, seq_cnt);
-                err
-            }) {
-            Ok(rez) => rez,
-            Err(_) => Err(Error::Timeout),
+    fn reply_matches(&self, reply: &EchoReply, seq_cnt: u16, payload: &[u8]) -> bool {
+        if reply.sequence != seq_cnt {
+            return false;
         }
+
+        if self.socket.socket_type() == SocketType::Raw && reply.identifier != self.ident {
+            return false;
+        }
+
+        payload.is_empty() || reply.payload == payload
+    }
+
+    /// Send a ping request with sequence number.
+    pub async fn ping(&self, seq_cnt: u16) -> Result<PingResult> {
+        let payload = request_payload(self.ident, seq_cnt, self.size);
+        let packet =
+            EchoRequest::new(self.host, self.ident, seq_cnt).encode_with_payload(&payload)?;
+        let sock_addr = SocketAddr::new(self.host, 0);
+
+        let sent = Instant::now();
+        let size = self.socket.send_to(&packet, &sock_addr.into()).await?;
+        if size != packet.len() {
+            return Err(Error::InvalidSize);
+        }
+
+        let reply = timeout(self.timeout, self.recv_reply(seq_cnt, &payload))
+            .await
+            .map_err(|_| Error::Timeout)??;
+
+        Ok(PingResult {
+            reply,
+            rtt: sent.elapsed(),
+            socket_type: self.socket.socket_type(),
+        })
     }
 }
 
+fn default_ident() -> u16 {
+    let pid = std::process::id() as u16;
+    let next = NEXT_IDENT.fetch_add(1, Ordering::Relaxed);
+    pid.wrapping_add(next)
+}
+
+fn request_payload(ident: u16, seq_cnt: u16, size: usize) -> Vec<u8> {
+    let mut payload = vec![0; size];
+    let token = [
+        b't',
+        b'p',
+        (ident >> 8) as u8,
+        ident as u8,
+        (seq_cnt >> 8) as u8,
+        seq_cnt as u8,
+        (size >> 8) as u8,
+        size as u8,
+    ];
+    let len = payload.len().min(TOKEN_SIZE);
+    payload[..len].copy_from_slice(&token[..len]);
+    payload
+}
+
 /// Assume the `buf`fer to be initialised.
-// TODO: replace with `MaybeUninit::slice_assume_init_ref` once stable.
+///
+/// # Safety
+///
+/// `socket2` initialises exactly the number of bytes returned by `recv_from`.
 unsafe fn assume_init(buf: &[MaybeUninit<u8>]) -> &[u8] {
-    &*(buf as *const [MaybeUninit<u8>] as *const [u8])
+    unsafe { &*(buf as *const [MaybeUninit<u8>] as *const [u8]) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_payload_respects_size() {
+        assert_eq!(request_payload(1, 2, 0), Vec::<u8>::new());
+        assert_eq!(request_payload(1, 2, 4), vec![b't', b'p', 0, 1]);
+        assert_eq!(request_payload(1, 2, 8), vec![b't', b'p', 0, 1, 0, 2, 0, 8]);
+    }
 }
